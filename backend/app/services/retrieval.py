@@ -6,10 +6,8 @@ import httpx
 from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload
 
-from app.config import get_settings
 from app.models import DocumentChunk
-
-settings = get_settings()
+from app.services.runtime_config import get_runtime_settings
 
 
 def _tokens(value: str) -> list[str]:
@@ -35,9 +33,11 @@ async def retrieve_chunks(
     chapter: str | None,
     limit: int,
 ) -> list[tuple[DocumentChunk, float]]:
+    settings = get_runtime_settings(db)
     if settings.vector_provider.lower() == "milvus":
         try:
-            return await _milvus_retrieve(db, query, library_id, chapter, limit)
+            matches = await _milvus_retrieve(db, query, library_id, chapter, limit, settings)
+            return await _rerank(query, matches, limit, settings)
         except (httpx.HTTPError, ValueError, KeyError, ImportError):
             # The lexical fallback keeps the question-answer workflow available.
             pass
@@ -50,20 +50,22 @@ async def retrieve_chunks(
 
     chunks = db.scalars(statement).unique().all()
     ranked = [(chunk, _lexical_score(query, chunk.content)) for chunk in chunks]
-    return sorted(ranked, key=lambda item: item[1], reverse=True)[:limit]
+    matches = sorted(ranked, key=lambda item: item[1], reverse=True)[: max(limit * 4, limit)]
+    return await _rerank(query, matches, limit, settings)
 
 
-async def index_chunks(chunks: list[DocumentChunk]) -> None:
+async def index_chunks(db: Session, chunks: list[DocumentChunk]) -> None:
+    settings = get_runtime_settings(db)
     if settings.vector_provider.lower() != "milvus" or not chunks:
         return
     if not (settings.milvus_uri and settings.embedding_base_url and settings.embedding_model):
         raise ValueError("Milvus retrieval requires MILVUS_URI, EMBEDDING_BASE_URL, and EMBEDDING_MODEL")
 
-    vectors = await _embed([chunk.content for chunk in chunks])
+    vectors = await _embed([chunk.content for chunk in chunks], settings)
     if not vectors:
         return
 
-    client = _milvus_client()
+    client = _milvus_client(settings)
     if not client.has_collection(collection_name=settings.milvus_collection):
         schema = client.create_schema(auto_id=False, enable_dynamic_field=False)
         schema.add_field(field_name="chunk_id", datatype=_milvus_data_type("VARCHAR"), is_primary=True, max_length=36)
@@ -99,10 +101,11 @@ async def index_chunks(chunks: list[DocumentChunk]) -> None:
     client.flush(collection_name=settings.milvus_collection)
 
 
-async def delete_chunks(document_ids: list[str]) -> None:
+async def delete_chunks(db: Session, document_ids: list[str]) -> None:
+    settings = get_runtime_settings(db)
     if settings.vector_provider.lower() != "milvus" or not document_ids:
         return
-    client = _milvus_client()
+    client = _milvus_client(settings)
     if not client.has_collection(collection_name=settings.milvus_collection):
         return
     quoted_ids = ",".join(f'"{item}"' for item in document_ids)
@@ -119,12 +122,13 @@ async def _milvus_retrieve(
     library_id: str | None,
     chapter: str | None,
     limit: int,
+    settings,
 ) -> list[tuple[DocumentChunk, float]]:
     if not (settings.milvus_uri and settings.embedding_base_url and settings.embedding_model):
         raise ValueError("Milvus retrieval is not configured")
 
-    vector = (await _embed([query]))[0]
-    client = _milvus_client()
+    vector = (await _embed([query], settings))[0]
+    client = _milvus_client(settings)
     filters: list[str] = []
     if library_id:
         filters.append(f'library_id == "{library_id}"')
@@ -156,7 +160,7 @@ async def _milvus_retrieve(
     return matches
 
 
-def _milvus_client():
+def _milvus_client(settings):
     try:
         from pymilvus import MilvusClient
     except ImportError as error:
@@ -180,7 +184,7 @@ def _delete_ids(client, chunk_ids: list[str]) -> None:
     )
 
 
-async def _embed(texts: list[str]) -> list[list[float]]:
+async def _embed(texts: list[str], settings) -> list[list[float]]:
     if not settings.embedding_base_url:
         raise ValueError("EMBEDDING_BASE_URL is required for vector retrieval")
     if settings.embedding_batch_size < 1:
@@ -202,7 +206,41 @@ async def _embed(texts: list[str]) -> list[list[float]]:
     return vectors
 
 
-async def generate_answer(query: str, matches: list[tuple[DocumentChunk, float]]) -> tuple[str, str]:
+async def _rerank(
+    query: str,
+    matches: list[tuple[DocumentChunk, float]],
+    limit: int,
+    settings,
+) -> list[tuple[DocumentChunk, float]]:
+    if not matches or not (settings.rerank_base_url and settings.rerank_model):
+        return matches[:limit]
+
+    headers = {"Authorization": f"Bearer {settings.rerank_api_key}"} if settings.rerank_api_key else {}
+    try:
+        async with httpx.AsyncClient(timeout=settings.embedding_timeout_seconds, trust_env=False) as client:
+            response = await client.post(
+                f"{settings.rerank_base_url.rstrip('/')}/rerank",
+                headers=headers,
+                json={
+                    "model": settings.rerank_model,
+                    "query": query,
+                    "documents": [chunk.content for chunk, _ in matches],
+                    "top_n": limit,
+                },
+            )
+            response.raise_for_status()
+        results = response.json()["results"]
+        reranked: list[tuple[DocumentChunk, float]] = []
+        for item in results:
+            index = int(item["index"])
+            if 0 <= index < len(matches):
+                reranked.append((matches[index][0], float(item.get("relevance_score", item.get("score", 0)))))
+        return reranked[:limit] or matches[:limit]
+    except (httpx.HTTPError, KeyError, TypeError, ValueError):
+        return matches[:limit]
+
+
+async def generate_answer(query: str, matches: list[tuple[DocumentChunk, float]], settings) -> tuple[str, str]:
     if not matches:
         return "No relevant source content was found in the selected library.", "local"
 
@@ -242,7 +280,11 @@ async def generate_answer(query: str, matches: list[tuple[DocumentChunk, float]]
         return best_chunk.content, "local-fallback"
 
 
-async def stream_answer(query: str, matches: list[tuple[DocumentChunk, float]]):
+async def stream_answer(query: str, matches: list[tuple[DocumentChunk, float]], settings=None):
+    if settings is None:
+        from app.config import get_settings
+
+        settings = get_settings()
     if not matches:
         async for item in _stream_text("No relevant source content was found in the selected library.", "local"):
             yield item

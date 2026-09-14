@@ -10,6 +10,7 @@ import {
   LibraryBig,
   Link2,
   LoaderCircle,
+  LogOut,
   MessageSquareText,
   Plus,
   Search,
@@ -17,20 +18,29 @@ import {
   Settings2,
   Trash2,
   Upload,
+  Users,
   X,
 } from "lucide-vue-next";
+import AdminPanel from "./components/AdminPanel.vue";
 import ChunkingSettings from "./components/ChunkingSettings.vue";
+import LoginView from "./components/LoginView.vue";
 import {
   api,
   type ChatMessage,
   type ChatSession,
   type ChunkingConfig,
+  type CurrentUser,
   type DocumentChunk,
   type DocumentChunkSummary,
   type DocumentRecord,
   type Library,
 } from "./api";
 
+const currentUser = ref<CurrentUser | null>(null);
+const bootstrapReady = ref(true);
+const authLoading = ref(true);
+const loginBusy = ref(false);
+const loginError = ref("");
 const libraries = ref<Library[]>([]);
 const chats = ref<ChatSession[]>([]);
 const activeLibraryId = ref("");
@@ -76,10 +86,13 @@ const chunkingConfig = ref<ChunkingConfig>({
   split_by_page: true,
   custom_delimiter: "========================",
 });
-type PageView = "libraries" | "chats";
+type PageView = "libraries" | "chats" | "users" | "settings";
 
 function pageFromPath(pathname: string): PageView {
-  return pathname === "/chats" ? "chats" : "libraries";
+  if (pathname === "/chats") return "chats";
+  if (pathname === "/users") return "users";
+  if (pathname === "/settings") return "settings";
+  return "libraries";
 }
 
 const view = ref<PageView>(pageFromPath(window.location.pathname));
@@ -92,21 +105,77 @@ const processingDocuments = computed(() => documents.value.filter((document) => 
 let progressPollTimer: ReturnType<typeof window.setInterval> | undefined;
 let progressPollInFlight = false;
 let chunkDetailRequest = 0;
+let chatStreamController: AbortController | undefined;
+let chatStreamTimeout: ReturnType<typeof window.setTimeout> | undefined;
 
 function replaceChat(updated: ChatSession) {
   chats.value = chats.value.map((chat) => (chat.id === updated.id ? updated : chat));
 }
 
-function navigate(nextView: PageView) {
-  const pathname = nextView === "chats" ? "/chats" : "/";
+function isAdminView(candidate: PageView) {
+  return candidate === "users" || candidate === "settings";
+}
+
+function ensureAccessibleView(user: CurrentUser | null) {
+  if (!user || user.role === "super_admin" || !isAdminView(view.value)) return;
+  view.value = "libraries";
+  if (window.location.pathname !== "/") {
+    window.history.replaceState({}, "", "/");
+  }
+}
+
+async function navigate(nextView: PageView) {
+  if (isAdminView(nextView) && currentUser.value?.role !== "super_admin") {
+    nextView = "libraries";
+  }
+  const pathname = nextView === "chats" ? "/chats" : nextView === "users" ? "/users" : nextView === "settings" ? "/settings" : "/";
   if (window.location.pathname !== pathname) {
     window.history.pushState({}, "", pathname);
   }
   view.value = nextView;
+
+  try {
+    if (nextView === "libraries") {
+      await loadLibraries();
+      await loadActiveLibrary();
+    } else if (nextView === "chats") {
+      await loadChats();
+      await loadActiveChat();
+    }
+  } catch (reason) {
+    error.value = reason instanceof Error ? reason.message : "页面刷新失败。";
+  }
 }
 
 function syncViewFromLocation() {
   view.value = pageFromPath(window.location.pathname);
+  ensureAccessibleView(currentUser.value);
+}
+
+async function login(payload: { username: string; password: string }) {
+  loginBusy.value = true;
+  loginError.value = "";
+  try {
+    currentUser.value = await api.login(payload);
+    ensureAccessibleView(currentUser.value);
+    await Promise.all([loadLibraries(), loadChats()]);
+  } catch (reason) {
+    loginError.value = reason instanceof Error ? reason.message : "登录失败";
+  } finally {
+    loginBusy.value = false;
+  }
+}
+
+async function logout() {
+  try {
+    await api.logout();
+  } finally {
+    currentUser.value = null;
+    libraries.value = [];
+    chats.value = [];
+    activeLibraryId.value = "";
+    activeChatId.value = "";
+  }
 }
 
 async function loadLibraries() {
@@ -309,6 +378,8 @@ function selectLibrary(id: string) {
 }
 
 function selectChat(chat: ChatSession) {
+  if (chat.id === activeChatId.value) return;
+  cancelChatStream();
   activeChatId.value = chat.id;
 }
 
@@ -422,6 +493,13 @@ async function sendMessage() {
   const query = prompt.value.trim();
   if (!chat || !chat.library_id || !query) return;
 
+  const controller = new AbortController();
+  let didTimeout = false;
+  chatStreamController = controller;
+  chatStreamTimeout = window.setTimeout(() => {
+    didTimeout = true;
+    controller.abort();
+  }, 120_000);
   chatBusy.value = true;
   error.value = "";
   prompt.value = "";
@@ -461,15 +539,35 @@ async function sendMessage() {
         });
         void scrollChatToBottom();
       },
+      signal: controller.signal,
     });
     await loadChats();
   } catch (reason) {
-    chatMessages.value = chatMessages.value.filter((message) => message.id !== temporaryAssistantId);
+    chatMessages.value = chatMessages.value.filter(
+      (message) => message.id !== temporaryUserId && message.id !== temporaryAssistantId,
+    );
     error.value = reason instanceof Error ? reason.message : "发送消息失败。";
+    if (controller.signal.aborted) {
+      error.value = didTimeout ? "响应超时，已停止生成。" : "已停止生成。";
+    }
+    if (activeChatId.value === chat.id) {
+      await loadActiveChat();
+    }
   } finally {
+    if (chatStreamTimeout) {
+      window.clearTimeout(chatStreamTimeout);
+      chatStreamTimeout = undefined;
+    }
+    if (chatStreamController === controller) {
+      chatStreamController = undefined;
+    }
     streamingAssistantId.value = "";
     chatBusy.value = false;
   }
+}
+
+function cancelChatStream() {
+  chatStreamController?.abort();
 }
 
 async function scrollChatToBottom() {
@@ -499,22 +597,41 @@ watch([activeLibraryId, processingDocuments], updateProgressPolling, { immediate
 onMounted(async () => {
   window.addEventListener("popstate", syncViewFromLocation);
   try {
-    await Promise.all([loadLibraries(), loadChats()]);
+    const status = await api.bootstrapStatus();
+    bootstrapReady.value = status.ready;
+    if (status.ready) {
+      try {
+        currentUser.value = await api.me();
+        ensureAccessibleView(currentUser.value);
+        await Promise.all([loadLibraries(), loadChats()]);
+      } catch {
+        currentUser.value = null;
+      }
+    }
   } catch (reason) {
     error.value = reason instanceof Error ? reason.message : "无法连接后端服务。";
   } finally {
     loading.value = false;
+    authLoading.value = false;
   }
 });
 
 onBeforeUnmount(() => {
   window.removeEventListener("popstate", syncViewFromLocation);
   stopProgressPolling();
+  cancelChatStream();
 });
 </script>
 
 <template>
-  <main class="workspace" :class="view === 'chats' ? 'chat-workspace' : 'knowledge-workspace'">
+  <LoginView
+    v-if="authLoading || !currentUser"
+    :ready="bootstrapReady"
+    :loading="authLoading || loginBusy"
+    :error="loginError"
+    @login="login"
+  />
+  <main v-else class="workspace" :class="view === 'chats' ? 'chat-workspace' : 'knowledge-workspace'">
     <aside class="sidebar">
       <div class="brand">
         <div class="brand-mark"><BookOpen :size="20" /></div>
@@ -532,6 +649,14 @@ onBeforeUnmount(() => {
         <button class="page-navigation-item" :class="{ active: view === 'chats' }" type="button" @click="navigate('chats')">
           <MessageSquareText :size="17" />
           <span>聊天</span>
+        </button>
+        <button v-if="currentUser.role === 'super_admin'" class="page-navigation-item" :class="{ active: view === 'users' }" type="button" @click="navigate('users')">
+          <Users :size="17" />
+          <span>成员</span>
+        </button>
+        <button v-if="currentUser.role === 'super_admin'" class="page-navigation-item" :class="{ active: view === 'settings' }" type="button" @click="navigate('settings')">
+          <Settings2 :size="17" />
+          <span>配置</span>
         </button>
       </nav>
 
@@ -568,7 +693,7 @@ onBeforeUnmount(() => {
         </nav>
       </section>
 
-      <section v-else class="sidebar-section chat-sidebar-section">
+      <section v-else-if="view === 'chats'" class="sidebar-section chat-sidebar-section">
         <div class="sidebar-title">
           <span>聊天</span>
           <button class="icon-button" type="button" title="创建聊天" @click="openNewChat"><Plus :size="17" /></button>
@@ -598,7 +723,10 @@ onBeforeUnmount(() => {
         </nav>
       </section>
 
-      <div class="sidebar-foot"><CircleHelp :size="16" /><span>PDF / DOCX / TXT / MD</span></div>
+      <div class="sidebar-foot sidebar-account">
+        <span>{{ currentUser.display_name }}</span>
+        <button class="icon-button" type="button" title="退出登录" @click="logout"><LogOut :size="16" /></button>
+      </div>
     </aside>
 
     <section v-if="view === 'libraries'" class="content">
@@ -701,7 +829,7 @@ onBeforeUnmount(() => {
       <div v-else class="state-line initial-loading">未选择知识库</div>
     </section>
 
-    <aside v-else class="assistant-panel">
+    <aside v-else-if="view === 'chats'" class="assistant-panel">
       <header>
         <div class="panel-icon"><MessageSquareText :size="18" /></div>
         <div class="chat-heading">
@@ -755,7 +883,11 @@ onBeforeUnmount(() => {
           :disabled="!activeChat || !activeChat.library_id || chatBusy"
           :placeholder="activeChat?.library_id ? '请输入关于当前知识库的问题' : '请先挂载知识库再发送消息'"
         ></textarea>
+        <button v-if="chatBusy" class="send-button" type="button" title="Stop generation" @click="cancelChatStream">
+          <X :size="18" />
+        </button>
         <button
+          v-else
           class="send-button"
           type="submit"
           title="发送消息"
@@ -766,6 +898,13 @@ onBeforeUnmount(() => {
         </button>
       </form>
     </aside>
+
+    <AdminPanel
+      v-if="view === 'users' || view === 'settings'"
+      :key="view"
+      :mode="view === 'users' ? 'users' : 'settings'"
+      :current-user="currentUser"
+    />
 
     <div v-if="showNewLibrary" class="modal-backdrop" @click.self="showNewLibrary = false">
       <form class="modal" @submit.prevent="createLibrary">

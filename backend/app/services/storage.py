@@ -1,20 +1,21 @@
 from io import BytesIO
 from pathlib import Path
 
-from app.config import get_settings
+from sqlalchemy.orm import Session
 
-settings = get_settings()
+from app.services.runtime_config import get_runtime_settings
 
 
 class ObjectStorageError(RuntimeError):
     pass
 
 
-def store_upload(key: str, payload: bytes, content_type: str | None) -> str:
+def store_upload(db: Session, key: str, payload: bytes, content_type: str | None) -> str:
+    settings = get_runtime_settings(db)
     if settings.storage_provider.lower() == "minio":
         try:
-            client = _minio_client()
-            bucket = _minio_bucket()
+            client = _minio_client(settings)
+            bucket = _minio_bucket(settings)
             if not client.bucket_exists(bucket):
                 client.make_bucket(bucket)
             client.put_object(
@@ -38,7 +39,8 @@ def store_upload(key: str, payload: bytes, content_type: str | None) -> str:
     raise ObjectStorageError(f"Unsupported storage provider: {settings.storage_provider}")
 
 
-def delete_upload(storage_path: str) -> None:
+def delete_upload(db: Session, storage_path: str) -> None:
+    settings = get_runtime_settings(db)
     if settings.storage_provider.lower() == "local":
         upload_dir = settings.upload_dir.resolve()
         target = Path(storage_path).resolve()
@@ -50,10 +52,10 @@ def delete_upload(storage_path: str) -> None:
         _, _, location = storage_path.partition("minio://")
         bucket, _, key = location.partition("/")
         if bucket and key:
-            _minio_client().remove_object(bucket, key)
+            _minio_client(settings).remove_object(bucket, key)
 
 
-def _minio_client():
+def _minio_client(settings):
     try:
         from minio import Minio
     except ImportError as error:
@@ -70,7 +72,7 @@ def _minio_client():
     )
 
 
-def _minio_bucket() -> str:
+def _minio_bucket(settings) -> str:
     if not settings.minio_bucket:
         raise ObjectStorageError("MINIO_BUCKET is required for STORAGE_PROVIDER=minio")
     return settings.minio_bucket

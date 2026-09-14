@@ -169,3 +169,98 @@ class ReindexRequest(ChunkingConfig):
 class ReindexResult(BaseModel):
     documents: int
     chunks: int
+
+
+class BootstrapStatusOut(BaseModel):
+    ready: bool
+
+
+class LoginRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=64)
+    password: str = Field(min_length=1, max_length=256)
+
+
+class UserOut(BaseModel):
+    id: str
+    username: str
+    display_name: str
+    role: Literal["super_admin", "member"]
+    is_active: bool
+    last_login_at: datetime | None
+    created_at: datetime | None
+
+
+class UserCreate(BaseModel):
+    username: str = Field(min_length=3, max_length=64, pattern=r"^[A-Za-z0-9_.-]+$")
+    display_name: str = Field(min_length=1, max_length=120)
+    password: str = Field(min_length=8, max_length=256)
+    role: Literal["super_admin", "member"] = "member"
+
+
+class UserUpdate(BaseModel):
+    display_name: str | None = Field(default=None, min_length=1, max_length=120)
+    password: str | None = Field(default=None, min_length=8, max_length=256)
+    role: Literal["super_admin", "member"] | None = None
+    is_active: bool | None = None
+
+
+class SystemSettingsOut(BaseModel):
+    storage_provider: Literal["local", "minio"]
+    minio_endpoint: str | None
+    minio_bucket: str | None
+    minio_secure: bool
+    vector_provider: Literal["local", "milvus"]
+    milvus_uri: str | None
+    milvus_collection: str
+    chunk_size: int = Field(ge=100, le=5000)
+    chunk_overlap: int = Field(ge=0, le=2000)
+    embedding_base_url: str | None
+    embedding_model: str
+    embedding_batch_size: int = Field(ge=1, le=256)
+    embedding_timeout_seconds: float = Field(ge=1, le=600)
+    rerank_base_url: str | None
+    rerank_model: str
+    llm_base_url: str | None
+    llm_model: str | None
+    llm_temperature: float = Field(ge=0, le=2)
+    ocr_provider: str
+    ocr_base_url: str | None
+    max_upload_mb: int = Field(ge=1, le=2048)
+    minio_access_key_configured: bool
+    minio_secret_key_configured: bool
+    milvus_token_configured: bool
+    embedding_api_key_configured: bool
+    rerank_api_key_configured: bool
+    llm_api_key_configured: bool
+    ocr_api_key_configured: bool
+
+
+class SystemSettingsUpdate(BaseModel):
+    storage_provider: Literal["local", "minio"] | None = None
+    minio_endpoint: str | None = None
+    minio_bucket: str | None = None
+    minio_secure: bool | None = None
+    minio_access_key: str | None = Field(default=None, max_length=512)
+    minio_secret_key: str | None = Field(default=None, max_length=512)
+    vector_provider: Literal["local", "milvus"] | None = None
+    milvus_uri: str | None = None
+    milvus_collection: str | None = Field(default=None, min_length=1, max_length=200)
+    milvus_token: str | None = Field(default=None, max_length=1024)
+    chunk_size: int | None = Field(default=None, ge=100, le=5000)
+    chunk_overlap: int | None = Field(default=None, ge=0, le=2000)
+    embedding_base_url: str | None = None
+    embedding_api_key: str | None = Field(default=None, max_length=1024)
+    embedding_model: str | None = Field(default=None, min_length=1, max_length=200)
+    embedding_batch_size: int | None = Field(default=None, ge=1, le=256)
+    embedding_timeout_seconds: float | None = Field(default=None, ge=1, le=600)
+    rerank_base_url: str | None = None
+    rerank_api_key: str | None = Field(default=None, max_length=1024)
+    rerank_model: str | None = Field(default=None, min_length=1, max_length=200)
+    llm_base_url: str | None = None
+    llm_api_key: str | None = Field(default=None, max_length=1024)
+    llm_model: str | None = Field(default=None, max_length=200)
+    llm_temperature: float | None = Field(default=None, ge=0, le=2)
+    ocr_provider: str | None = Field(default=None, max_length=80)
+    ocr_base_url: str | None = None
+    ocr_api_key: str | None = Field(default=None, max_length=1024)
+    max_upload_mb: int | None = Field(default=None, ge=1, le=2048)

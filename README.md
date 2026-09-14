@@ -28,21 +28,34 @@ backend. The new `document_chunks` table is created automatically at startup.
 
 ## Configuration
 
-Copy `.env.example` to `.env` and set the PostgreSQL, MinIO, Milvus, and
-embedding-provider values.
+Copy `.env.example` to `.env`. Database connection, CORS, cookie settings,
+the configuration-encryption key, and bootstrap administrator remain deployment
+settings in the environment file:
 
 ```env
-STORAGE_PROVIDER=minio
-VECTOR_PROVIDER=milvus
-MILVUS_COLLECTION=tiku_document_chunks
-CHUNK_SIZE=800
-CHUNK_OVERLAP=120
-EMBEDDING_BATCH_SIZE=8
-EMBEDDING_TIMEOUT_SECONDS=120
+DATABASE_URL=postgresql+psycopg://username:password@db.example.com:5432/tiku_rag
+SETTINGS_ENCRYPTION_KEY=<Fernet URL-safe base64 key>
+BOOTSTRAP_ADMIN_USERNAME=admin
+BOOTSTRAP_ADMIN_PASSWORD=change-me-to-a-long-password
+SESSION_COOKIE_SECURE=true
 ```
 
-For standard deployment, do not use `STORAGE_PROVIDER=local`; it writes
-original uploads under `backend/data/uploads`.
+On first startup, the bootstrap administrator is created from those two
+administrator variables. Public registration is not available. Sign in with
+that account to create members and configure the LLM, embedding, rerank,
+Milvus, object storage, OCR, chunk defaults, and upload limits from the system
+configuration page. Secret configuration values are encrypted before being
+stored in the database and are never returned to the browser.
+
+Generate a Fernet key with:
+
+```powershell
+cd backend
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```
+
+For standard deployment, do not use local object storage; it writes original
+uploads beneath `backend/data/uploads`.
 
 ## Local startup
 

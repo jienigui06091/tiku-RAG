@@ -104,6 +104,7 @@ export interface ChatExchange {
 export interface ChatStreamHandlers {
   onDelta: (content: string) => void;
   onDone: (exchange: ChatExchange) => void;
+  signal?: AbortSignal;
 }
 
 export interface ChunkingConfig {
@@ -120,20 +121,77 @@ export interface ReindexResult {
   chunks: number;
 }
 
+export interface CurrentUser {
+  id: string;
+  username: string;
+  display_name: string;
+  role: "super_admin" | "member";
+  is_active: boolean;
+  last_login_at: string | null;
+  created_at: string | null;
+}
+
+export interface SystemSettings {
+  storage_provider: "local" | "minio";
+  minio_endpoint: string | null;
+  minio_bucket: string | null;
+  minio_secure: boolean;
+  vector_provider: "local" | "milvus";
+  milvus_uri: string | null;
+  milvus_collection: string;
+  chunk_size: number;
+  chunk_overlap: number;
+  embedding_base_url: string | null;
+  embedding_model: string;
+  embedding_batch_size: number;
+  embedding_timeout_seconds: number;
+  rerank_base_url: string | null;
+  rerank_model: string;
+  llm_base_url: string | null;
+  llm_model: string | null;
+  llm_temperature: number;
+  ocr_provider: string;
+  ocr_base_url: string | null;
+  max_upload_mb: number;
+  minio_access_key_configured: boolean;
+  minio_secret_key_configured: boolean;
+  milvus_token_configured: boolean;
+  embedding_api_key_configured: boolean;
+  rerank_api_key_configured: boolean;
+  llm_api_key_configured: boolean;
+  ocr_api_key_configured: boolean;
+}
+
+export type SystemSettingsUpdate = Partial<Omit<SystemSettings,
+  "minio_access_key_configured" | "minio_secret_key_configured" | "milvus_token_configured" |
+  "embedding_api_key_configured" | "rerank_api_key_configured" | "llm_api_key_configured" |
+  "ocr_api_key_configured"
+>> & {
+  minio_access_key?: string;
+  minio_secret_key?: string;
+  milvus_token?: string;
+  embedding_api_key?: string;
+  rerank_api_key?: string;
+  llm_api_key?: string;
+  ocr_api_key?: string;
+};
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`/api${path}`, {
     headers: { "Content-Type": "application/json", ...init?.headers },
+    credentials: "same-origin",
     ...init,
   });
   if (!response.ok) {
     const payload = await response.json().catch(() => null);
     throw new Error(payload?.detail || "请求失败");
   }
+  if (response.status === 204) return undefined as T;
   return response.json() as Promise<T>;
 }
 
 async function deleteRequest(path: string): Promise<void> {
-  const response = await fetch(`/api${path}`, { method: "DELETE" });
+  const response = await fetch(`/api${path}`, { method: "DELETE", credentials: "same-origin" });
   if (!response.ok) {
     const payload = await response.json().catch(() => null);
     throw new Error(payload?.detail || "删除失败");
@@ -144,7 +202,9 @@ async function streamChatMessage(chatId: string, query: string, handlers: ChatSt
   const response = await fetch(`/api/chats/${chatId}/messages`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
+    credentials: "same-origin",
     body: JSON.stringify({ query }),
+    signal: handlers.signal,
   });
   if (!response.ok) {
     const payload = await response.json().catch(() => null);
@@ -193,6 +253,23 @@ function parseSseEvent(rawEvent: string): { type: string; data: Record<string, u
 }
 
 export const api = {
+  bootstrapStatus: () => request<{ ready: boolean }>("/auth/bootstrap-status"),
+  login: (payload: { username: string; password: string }) =>
+    request<CurrentUser>("/auth/login", { method: "POST", body: JSON.stringify(payload) }),
+  logout: () => request<void>("/auth/logout", { method: "POST" }),
+  me: () => request<CurrentUser>("/auth/me"),
+  listUsers: () => request<CurrentUser[]>("/admin/users"),
+  createUser: (payload: { username: string; display_name: string; password: string; role: "super_admin" | "member" }) =>
+    request<CurrentUser>("/admin/users", { method: "POST", body: JSON.stringify(payload) }),
+  updateUser: (userId: string, payload: Partial<{
+    display_name: string;
+    password: string;
+    role: "super_admin" | "member";
+    is_active: boolean;
+  }>) => request<CurrentUser>(`/admin/users/${userId}`, { method: "PATCH", body: JSON.stringify(payload) }),
+  getSystemSettings: () => request<SystemSettings>("/admin/settings"),
+  updateSystemSettings: (payload: SystemSettingsUpdate) =>
+    request<SystemSettings>("/admin/settings", { method: "PUT", body: JSON.stringify(payload) }),
   listLibraries: () => request<Library[]>("/libraries"),
   createLibrary: (payload: { name: string; subject?: string; description?: string }) =>
     request<Library>("/libraries", { method: "POST", body: JSON.stringify(payload) }),
@@ -214,7 +291,11 @@ export const api = {
     body.append("retain_context", String(chunking.retain_context));
     body.append("split_by_page", String(chunking.split_by_page));
     body.append("custom_delimiter", chunking.custom_delimiter);
-    const response = await fetch(`/api/libraries/${libraryId}/documents`, { method: "POST", body });
+    const response = await fetch(`/api/libraries/${libraryId}/documents`, {
+      method: "POST",
+      body,
+      credentials: "same-origin",
+    });
     if (!response.ok) {
       const payload = await response.json().catch(() => null);
       throw new Error(payload?.detail || "上传失败");

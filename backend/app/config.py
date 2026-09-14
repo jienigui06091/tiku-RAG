@@ -10,6 +10,12 @@ class Settings(BaseSettings):
     cors_origins: str = "http://localhost:5173"
     data_dir: Path = Path("./data")
     database_url: str = "sqlite:///./data/tiku-rag.db"
+    session_cookie_name: str = "tiku_rag_session"
+    session_ttl_hours: int = 72
+    session_cookie_secure: bool = False
+    settings_encryption_key: str | None = None
+    bootstrap_admin_username: str | None = None
+    bootstrap_admin_password: str | None = None
     storage_provider: str = "local"
     minio_endpoint: str | None = None
     minio_access_key: str | None = None
@@ -39,7 +45,11 @@ class Settings(BaseSettings):
     ocr_api_key: str | None = None
     max_upload_mb: int = 50
 
-    model_config = SettingsConfigDict(env_file="../.env", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file="../.env",
+        extra="ignore",
+        protected_namespaces=("model_",),
+    )
 
     @property
     def upload_dir(self) -> Path:
