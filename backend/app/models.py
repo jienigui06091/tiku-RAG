@@ -30,6 +30,8 @@ class Document(Base):
     mime_type: Mapped[str | None] = mapped_column(String(120), nullable=True)
     page_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     status: Mapped[str] = mapped_column(String(32), default="processing")
+    processing_stage: Mapped[str] = mapped_column(String(32), default="queued", server_default="queued")
+    progress: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     raw_text: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -78,7 +80,7 @@ class ChatSession(Base):
     __tablename__ = "chat_sessions"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    title: Mapped[str] = mapped_column(String(120), default="New chat")
+    title: Mapped[str] = mapped_column(String(120), default="新建聊天")
     library_id: Mapped[str | None] = mapped_column(ForeignKey("libraries.id"), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(

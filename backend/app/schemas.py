@@ -27,6 +27,8 @@ class DocumentOut(BaseModel):
     mime_type: str | None
     page_count: int | None
     status: str
+    processing_stage: str
+    progress: int
     error_message: str | None
     created_at: datetime | None
     question_count: int = 0
@@ -83,15 +85,24 @@ class DocumentChunkOut(BaseModel):
     document_name: str | None = None
 
 
+class DocumentChunkSummaryOut(BaseModel):
+    id: str
+    sequence: int
+    content_preview: str
+    chapter: str | None
+    source_page_start: int | None
+    source_page_end: int | None
+    document_name: str | None = None
+
+
 class DocumentChunkPage(BaseModel):
-    items: list[DocumentChunkOut]
+    items: list[DocumentChunkSummaryOut]
     total: int
     page: int
     page_size: int
 
 
 class ChatSessionCreate(BaseModel):
-    title: str = Field(default="New chat", min_length=1, max_length=120)
     library_id: str | None = None
 
 

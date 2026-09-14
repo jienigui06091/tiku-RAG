@@ -1,3 +1,4 @@
+import json
 import re
 from collections import Counter
 
@@ -239,6 +240,73 @@ async def generate_answer(query: str, matches: list[tuple[DocumentChunk, float]]
         return answer, "llm"
     except (httpx.HTTPError, KeyError, IndexError, TypeError):
         return best_chunk.content, "local-fallback"
+
+
+async def stream_answer(query: str, matches: list[tuple[DocumentChunk, float]]):
+    if not matches:
+        async for item in _stream_text("No relevant source content was found in the selected library.", "local"):
+            yield item
+        return
+
+    best_chunk, _ = matches[0]
+    if not (settings.llm_base_url and settings.llm_api_key and settings.llm_model):
+        async for item in _stream_text(best_chunk.content, "local"):
+            yield item
+        return
+
+    context = "\n\n".join(
+        _format_context(index, chunk)
+        for index, (chunk, _) in enumerate(matches, start=1)
+    )
+    payload = {
+        "model": settings.llm_model,
+        "temperature": settings.llm_temperature,
+        "stream": True,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "Answer only from the supplied source chunks. "
+                    "State when the sources do not provide enough evidence."
+                ),
+            },
+            {"role": "user", "content": f"Question: {query}\n\nSource chunks:\n{context}"},
+        ],
+    }
+    received_content = False
+    try:
+        async with httpx.AsyncClient(timeout=30, trust_env=False) as client:
+            async with client.stream(
+                "POST",
+                f"{settings.llm_base_url.rstrip('/')}/chat/completions",
+                headers={"Authorization": f"Bearer {settings.llm_api_key}"},
+                json=payload,
+            ) as response:
+                response.raise_for_status()
+                async for raw_line in response.aiter_lines():
+                    line = raw_line.strip()
+                    if not line or not line.startswith("data:"):
+                        continue
+                    data = line.removeprefix("data:").strip()
+                    if data == "[DONE]":
+                        return
+                    event = json.loads(data)
+                    content = event["choices"][0].get("delta", {}).get("content")
+                    if content:
+                        received_content = True
+                        yield "llm", content
+    except (httpx.HTTPError, KeyError, IndexError, TypeError, json.JSONDecodeError):
+        if received_content:
+            return
+
+    if not received_content:
+        async for item in _stream_text(best_chunk.content, "local-fallback"):
+            yield item
+
+
+async def _stream_text(content: str, mode: str, chunk_size: int = 80):
+    for start in range(0, len(content), chunk_size):
+        yield mode, content[start:start + chunk_size]
 
 
 def _format_context(index: int, chunk: DocumentChunk) -> str:

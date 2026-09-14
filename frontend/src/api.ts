@@ -12,6 +12,8 @@ export interface DocumentRecord {
   id: string;
   filename: string;
   status: string;
+  processing_stage: string;
+  progress: number;
   page_count: number | null;
   error_message: string | null;
   question_count: number;
@@ -49,8 +51,18 @@ export interface DocumentChunk {
   document_name: string | null;
 }
 
+export interface DocumentChunkSummary {
+  id: string;
+  sequence: number;
+  content_preview: string;
+  chapter: string | null;
+  source_page_start: number | null;
+  source_page_end: number | null;
+  document_name: string | null;
+}
+
 export interface DocumentChunkPage {
-  items: DocumentChunk[];
+  items: DocumentChunkSummary[];
   total: number;
   page: number;
   page_size: number;
@@ -89,6 +101,11 @@ export interface ChatExchange {
   retrieval_mode: string;
 }
 
+export interface ChatStreamHandlers {
+  onDelta: (content: string) => void;
+  onDone: (exchange: ChatExchange) => void;
+}
+
 export interface ChunkingConfig {
   chunk_model: "interface" | "structured" | "fixed" | "delimiter";
   chunk_size: number;
@@ -123,6 +140,58 @@ async function deleteRequest(path: string): Promise<void> {
   }
 }
 
+async function streamChatMessage(chatId: string, query: string, handlers: ChatStreamHandlers): Promise<void> {
+  const response = await fetch(`/api/chats/${chatId}/messages`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
+    body: JSON.stringify({ query }),
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => null);
+    throw new Error(payload?.detail || "发送消息失败。");
+  }
+  if (!response.body) {
+    throw new Error("浏览器不支持流式响应。");
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      buffer += decoder.decode(value, { stream: !done });
+
+      let boundary = buffer.indexOf("\n\n");
+      while (boundary !== -1) {
+        const event = parseSseEvent(buffer.slice(0, boundary));
+        buffer = buffer.slice(boundary + 2);
+        if (event) {
+          if (event.type === "delta") {
+            handlers.onDelta(event.data.content as string);
+          } else if (event.type === "done") {
+            handlers.onDone(event.data as ChatExchange);
+          } else if (event.type === "error") {
+            throw new Error(String(event.data.detail || "发送消息失败。"));
+          }
+        }
+        boundary = buffer.indexOf("\n\n");
+      }
+      if (done) break;
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+function parseSseEvent(rawEvent: string): { type: string; data: Record<string, unknown> } | null {
+  const lines = rawEvent.split(/\r?\n/);
+  const type = lines.find((line) => line.startsWith("event:"))?.slice(6).trim();
+  const data = lines.find((line) => line.startsWith("data:"))?.slice(5).trim();
+  if (!type || !data) return null;
+  return { type, data: JSON.parse(data) as Record<string, unknown> };
+}
+
 export const api = {
   listLibraries: () => request<Library[]>("/libraries"),
   createLibrary: (payload: { name: string; subject?: string; description?: string }) =>
@@ -134,6 +203,8 @@ export const api = {
     if (keyword) params.set("keyword", keyword);
     return request<DocumentChunkPage>(`/libraries/${libraryId}/chunks?${params}`);
   },
+  getChunk: (libraryId: string, chunkId: string) =>
+    request<DocumentChunk>(`/libraries/${libraryId}/chunks/${chunkId}`),
   upload: async (libraryId: string, file: File, chunking: ChunkingConfig) => {
     const body = new FormData();
     body.append("file", file);
@@ -156,7 +227,7 @@ export const api = {
       body: JSON.stringify(chunking),
     }),
   listChats: () => request<ChatSession[]>("/chats"),
-  createChat: (payload: { title: string; library_id?: string }) =>
+  createChat: (payload: { library_id?: string }) =>
     request<ChatSession>("/chats", {
       method: "POST",
       body: JSON.stringify(payload),
@@ -168,9 +239,5 @@ export const api = {
     }),
   deleteChat: (chatId: string) => deleteRequest(`/chats/${chatId}`),
   listChatMessages: (chatId: string) => request<ChatMessage[]>(`/chats/${chatId}/messages`),
-  sendChatMessage: (chatId: string, query: string) =>
-    request<ChatExchange>(`/chats/${chatId}/messages`, {
-      method: "POST",
-      body: JSON.stringify({ query }),
-    }),
+  streamChatMessage,
 };

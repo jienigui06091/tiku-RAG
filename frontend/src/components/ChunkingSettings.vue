@@ -39,7 +39,7 @@ function updateNumber(key: "chunk_size" | "chunk_overlap", event: Event) {
         <section class="settings-section">
           <div class="section-heading">
             <div class="section-icon"><SlidersHorizontal :size="17" /></div>
-            <div><h3>分块模型</h3><p>选择文档分块时优先识别的边界。</p></div>
+            <div><h3>分块方式</h3><p>选择文档分块时优先识别的边界。</p></div>
           </div>
 
           <div class="model-list">

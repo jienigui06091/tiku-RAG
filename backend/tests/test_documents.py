@@ -72,6 +72,21 @@ class DocumentChunkingTests(unittest.TestCase):
         self.assertEqual(chunks[1].content, "Get order endpoint\nGET /orders/{id}")
         self.assertTrue(all(delimiter not in chunk.content for chunk in chunks))
 
+    def test_delimiter_model_does_not_apply_size_or_overlap_rules(self):
+        delimiter = "========================"
+        first_section = "A" * 800
+        second_section = "B" * 800
+
+        chunks = chunk_document(
+            f"{first_section}\n{delimiter}\n{second_section}",
+            chunk_size=100,
+            chunk_overlap=50,
+            chunk_model="delimiter",
+            custom_delimiter=delimiter,
+        )
+
+        self.assertEqual([chunk.content for chunk in chunks], [first_section, second_section])
+
     def test_delimiter_model_requires_a_delimiter(self):
         with self.assertRaisesRegex(ValueError, "custom_delimiter"):
             chunk_document("content", 500, 0, chunk_model="delimiter")

@@ -1,15 +1,16 @@
+import json
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-import httpx
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Response, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Query, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import delete, func, or_, select, update
+from fastapi.responses import StreamingResponse
+from sqlalchemy import delete, func, inspect, or_, select, text, update
 from sqlalchemy.orm import Session, joinedload
 
 from app.config import get_settings
-from app.database import Base, engine, get_db
+from app.database import Base, SessionLocal, engine, get_db
 from app.models import ChatMessage, ChatSession, Document, DocumentChunk, Library, Question
 from app.schemas import (
     ChatExchangeOut,
@@ -24,6 +25,7 @@ from app.schemas import (
     ChunkingConfig,
     DocumentChunkOut,
     DocumentChunkPage,
+    DocumentChunkSummaryOut,
     DocumentOut,
     LibraryCreate,
     LibraryOut,
@@ -32,8 +34,8 @@ from app.schemas import (
     ReindexRequest,
     ReindexResult,
 )
-from app.services.documents import UnsupportedDocumentError, chunk_document, extract_text_from_bytes, parse_questions
-from app.services.retrieval import delete_chunks, generate_answer, index_chunks, retrieve_chunks
+from app.services.documents import chunk_document, extract_text_from_bytes, parse_questions
+from app.services.retrieval import delete_chunks, generate_answer, index_chunks, retrieve_chunks, stream_answer
 from app.services.storage import ObjectStorageError, delete_upload, store_upload
 
 settings = get_settings()
@@ -50,6 +52,7 @@ app.add_middleware(
 @app.on_event("startup")
 def create_tables() -> None:
     Base.metadata.create_all(bind=engine)
+    _ensure_document_progress_columns()
 
 
 @app.get("/api/health")
@@ -119,9 +122,10 @@ def list_documents(library_id: str, db: Session = Depends(get_db)):
     return [_document_out(db, document) for document in documents]
 
 
-@app.post("/api/libraries/{library_id}/documents", response_model=DocumentOut, status_code=201)
+@app.post("/api/libraries/{library_id}/documents", response_model=DocumentOut, status_code=202)
 async def upload_document(
     library_id: str,
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     chunk_model: str = Form(default="interface"),
     chunk_size: int = Form(default=settings.chunk_size),
@@ -158,46 +162,20 @@ async def upload_document(
             filename=original_name,
             storage_path=storage_path,
             mime_type=file.content_type,
+            status="processing",
+            processing_stage="queued",
+            progress=0,
         )
         db.add(document)
-        db.flush()
-
-        raw_text, page_count = extract_text_from_bytes(payload, suffix)
-        document.raw_text = raw_text
-        document.page_count = page_count
-
-        parsed_questions = parse_questions(raw_text)
-        for parsed in parsed_questions:
-            db.add(
-                Question(
-                    library_id=library_id,
-                    document_id=document.id,
-                    sequence=parsed.sequence,
-                    stem=parsed.stem,
-                    options=parsed.options,
-                    answer=parsed.answer,
-                    analysis=parsed.analysis,
-                    source_page=parsed.source_page,
-                )
-            )
-
-        chunks = _create_chunks(document, raw_text, chunking)
-        db.add_all(chunks)
-        db.flush()
-        await index_chunks(chunks)
-        document.status = "ready"
         db.commit()
-    except (ObjectStorageError, UnsupportedDocumentError, ValueError, OSError, httpx.HTTPError, ImportError) as error:
-        if "document" in locals():
-            document.status = "failed"
-            document.error_message = f"{type(error).__name__}: {error}"
-            db.commit()
+        db.refresh(document)
+    except (ObjectStorageError, ValueError, OSError) as error:
         raise HTTPException(
             status_code=422,
             detail=f"Document ingestion failed: {type(error).__name__}: {error}",
         ) from error
 
-    db.refresh(document)
+    background_tasks.add_task(_ingest_document, document.id, payload, suffix, chunking)
     return _document_out(db, document)
 
 
@@ -292,11 +270,27 @@ def list_document_chunks(
         .limit(page_size)
     ).unique().all()
     return DocumentChunkPage(
-        items=[_document_chunk_out(chunk) for chunk in chunks],
+        items=[_document_chunk_summary_out(chunk) for chunk in chunks],
         total=total,
         page=page,
         page_size=page_size,
     )
+
+
+@app.get("/api/libraries/{library_id}/chunks/{chunk_id}", response_model=DocumentChunkOut)
+def get_document_chunk(library_id: str, chunk_id: str, db: Session = Depends(get_db)):
+    _get_library(db, library_id)
+    chunk = db.scalar(
+        select(DocumentChunk)
+        .options(joinedload(DocumentChunk.document))
+        .where(
+            DocumentChunk.id == chunk_id,
+            DocumentChunk.library_id == library_id,
+        )
+    )
+    if not chunk:
+        raise HTTPException(status_code=404, detail="Document chunk not found")
+    return _document_chunk_out(chunk)
 
 
 @app.get("/api/chats", response_model=list[ChatSessionOut])
@@ -313,7 +307,7 @@ def list_chat_sessions(db: Session = Depends(get_db)):
 def create_chat_session(payload: ChatSessionCreate, db: Session = Depends(get_db)):
     if payload.library_id:
         _get_library(db, payload.library_id)
-    chat = ChatSession(**payload.model_dump())
+    chat = ChatSession(title="新建聊天", **payload.model_dump())
     db.add(chat)
     db.commit()
     db.refresh(chat)
@@ -356,7 +350,7 @@ def list_chat_messages(chat_id: str, db: Session = Depends(get_db)):
     return [_chat_message_out(message) for message in messages]
 
 
-@app.post("/api/chats/{chat_id}/messages", response_model=ChatExchangeOut)
+@app.post("/api/chats/{chat_id}/messages")
 async def send_chat_message(
     chat_id: str,
     payload: ChatMessageCreate,
@@ -366,40 +360,66 @@ async def send_chat_message(
     if not chat.library_id:
         raise HTTPException(status_code=422, detail="Attach a knowledge base before sending a message")
 
-    matches = await retrieve_chunks(db, payload.query, chat.library_id, None, payload.top_k)
-    answer, mode = await generate_answer(payload.query, matches)
-    citations = [
-        Citation(
-            id=chunk.id,
-            document_name=chunk.document.filename if chunk.document else None,
-            chunk_sequence=chunk.sequence,
-            source_page_start=chunk.source_page_start,
-            source_page_end=chunk.source_page_end,
-            chapter=chunk.chapter,
-            score=round(score, 3),
-        )
-        for chunk, score in matches
-    ]
+    is_first_message = not db.scalar(
+        select(func.count(ChatMessage.id)).where(ChatMessage.chat_session_id == chat.id)
+    )
     user_message = ChatMessage(
         chat_session_id=chat.id,
         role="user",
         content=payload.query,
     )
-    assistant_message = ChatMessage(
-        chat_session_id=chat.id,
-        role="assistant",
-        content=answer,
-        citations=[citation.model_dump() for citation in citations],
-    )
+    if is_first_message:
+        chat.title = _chat_title_from_first_message(payload.query)
     chat.updated_at = datetime.now(timezone.utc)
-    db.add_all([user_message, assistant_message])
+    db.add(user_message)
     db.commit()
     db.refresh(user_message)
-    db.refresh(assistant_message)
-    return ChatExchangeOut(
-        user_message=_chat_message_out(user_message),
-        assistant_message=_chat_message_out(assistant_message),
-        retrieval_mode=mode,
+
+    async def event_stream():
+        try:
+            matches = await retrieve_chunks(db, payload.query, chat.library_id, None, payload.top_k)
+            citations = [
+                Citation(
+                    id=chunk.id,
+                    document_name=chunk.document.filename if chunk.document else None,
+                    chunk_sequence=chunk.sequence,
+                    source_page_start=chunk.source_page_start,
+                    source_page_end=chunk.source_page_end,
+                    chapter=chunk.chapter,
+                    score=round(score, 3),
+                )
+                for chunk, score in matches
+            ]
+            answer_parts: list[str] = []
+            mode = "local"
+            async for mode, content in stream_answer(payload.query, matches):
+                answer_parts.append(content)
+                yield _sse_event("delta", {"content": content})
+
+            assistant_message = ChatMessage(
+                chat_session_id=chat.id,
+                role="assistant",
+                content="".join(answer_parts),
+                citations=[citation.model_dump() for citation in citations],
+            )
+            chat.updated_at = datetime.now(timezone.utc)
+            db.add(assistant_message)
+            db.commit()
+            db.refresh(assistant_message)
+            exchange = ChatExchangeOut(
+                user_message=_chat_message_out(user_message),
+                assistant_message=_chat_message_out(assistant_message),
+                retrieval_mode=mode,
+            )
+            yield _sse_event("done", exchange.model_dump(mode="json"))
+        except Exception as error:
+            db.rollback()
+            yield _sse_event("error", {"detail": f"Message generation failed: {error}"})
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 
@@ -463,6 +483,88 @@ def _get_library(db: Session, library_id: str) -> Library:
     return library
 
 
+def _ensure_document_progress_columns() -> None:
+    column_names = {column["name"] for column in inspect(engine).get_columns("documents")}
+    statements: list[str] = []
+    if "processing_stage" not in column_names:
+        statements.append(
+            "ALTER TABLE documents ADD COLUMN processing_stage VARCHAR(32) NOT NULL DEFAULT 'queued'"
+        )
+    if "progress" not in column_names:
+        statements.append("ALTER TABLE documents ADD COLUMN progress INTEGER NOT NULL DEFAULT 0")
+    if not statements:
+        return
+
+    with engine.begin() as connection:
+        for statement in statements:
+            connection.execute(text(statement))
+
+
+async def _ingest_document(
+    document_id: str,
+    payload: bytes,
+    suffix: str,
+    chunking: ChunkingConfig,
+) -> None:
+    db = SessionLocal()
+    try:
+        document = db.get(Document, document_id)
+        if not document:
+            return
+
+        _set_document_progress(db, document, "extracting", 5)
+        raw_text, page_count = extract_text_from_bytes(payload, suffix)
+        document.raw_text = raw_text
+        document.page_count = page_count
+        _set_document_progress(db, document, "parsing", 25)
+
+        parsed_questions = parse_questions(raw_text)
+        for parsed in parsed_questions:
+            db.add(
+                Question(
+                    library_id=document.library_id,
+                    document_id=document.id,
+                    sequence=parsed.sequence,
+                    stem=parsed.stem,
+                    options=parsed.options,
+                    answer=parsed.answer,
+                    analysis=parsed.analysis,
+                    source_page=parsed.source_page,
+                )
+            )
+        _set_document_progress(db, document, "chunking", 45)
+
+        chunks = _create_chunks(document, raw_text, chunking)
+        db.add_all(chunks)
+        db.flush()
+        _set_document_progress(db, document, "indexing", 70)
+        await index_chunks(chunks)
+
+        document.status = "ready"
+        document.processing_stage = "ready"
+        document.progress = 100
+        document.error_message = None
+        db.commit()
+    except Exception as error:
+        db.rollback()
+        document = db.get(Document, document_id)
+        if document:
+            document.status = "failed"
+            document.processing_stage = "failed"
+            document.error_message = f"{type(error).__name__}: {error}"
+            db.commit()
+    finally:
+        db.close()
+
+
+def _set_document_progress(db: Session, document: Document, stage: str, progress: int) -> None:
+    document.status = "processing"
+    document.processing_stage = stage
+    document.progress = progress
+    document.error_message = None
+    db.commit()
+
+
 def _get_chat_session(db: Session, chat_id: str) -> ChatSession:
     chat = db.scalar(
         select(ChatSession)
@@ -472,6 +574,13 @@ def _get_chat_session(db: Session, chat_id: str) -> ChatSession:
     if not chat:
         raise HTTPException(status_code=404, detail="Chat not found")
     return chat
+
+
+def _chat_title_from_first_message(query: str) -> str:
+    title = " ".join(query.split()).rstrip("。！？?!；;，,")
+    if not title:
+        return "新建聊天"
+    return f"{title[:36]}..." if len(title) > 36 else title
 
 
 def _library_out(library: Library, document_count: int, question_count: int, chunk_count: int) -> LibraryOut:
@@ -494,6 +603,8 @@ def _document_out(db: Session, document: Document) -> DocumentOut:
         mime_type=document.mime_type,
         page_count=document.page_count,
         status=document.status,
+        processing_stage=document.processing_stage,
+        progress=document.progress,
         error_message=document.error_message,
         created_at=document.created_at,
         question_count=db.scalar(select(func.count(Question.id)).where(Question.document_id == document.id)) or 0,
@@ -530,6 +641,20 @@ def _document_chunk_out(chunk: DocumentChunk) -> DocumentChunkOut:
     )
 
 
+def _document_chunk_summary_out(chunk: DocumentChunk) -> DocumentChunkSummaryOut:
+    content = " ".join(chunk.content.split())
+    preview_length = 180
+    return DocumentChunkSummaryOut(
+        id=chunk.id,
+        sequence=chunk.sequence,
+        content_preview=f"{content[:preview_length]}..." if len(content) > preview_length else content,
+        chapter=chunk.chapter,
+        source_page_start=chunk.source_page_start,
+        source_page_end=chunk.source_page_end,
+        document_name=chunk.document.filename if chunk.document else None,
+    )
+
+
 def _chat_session_out(chat: ChatSession) -> ChatSessionOut:
     return ChatSessionOut(
         id=chat.id,
@@ -549,3 +674,7 @@ def _chat_message_out(message: ChatMessage) -> ChatMessageOut:
         citations=[Citation.model_validate(citation) for citation in (message.citations or [])],
         created_at=message.created_at,
     )
+
+
+def _sse_event(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"

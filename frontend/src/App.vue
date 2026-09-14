@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import {
   BookOpen,
   ChevronLeft,
@@ -26,6 +26,7 @@ import {
   type ChatSession,
   type ChunkingConfig,
   type DocumentChunk,
+  type DocumentChunkSummary,
   type DocumentRecord,
   type Library,
 } from "./api";
@@ -34,7 +35,7 @@ const libraries = ref<Library[]>([]);
 const chats = ref<ChatSession[]>([]);
 const activeLibraryId = ref("");
 const activeChatId = ref("");
-const chunks = ref<DocumentChunk[]>([]);
+const chunks = ref<DocumentChunkSummary[]>([]);
 const documents = ref<DocumentRecord[]>([]);
 const chatMessages = ref<ChatMessage[]>([]);
 const totalChunks = ref(0);
@@ -55,12 +56,18 @@ const newChatError = ref("");
 const showNewLibrary = ref(false);
 const showNewChat = ref(false);
 const showChunkSettings = ref(false);
+const showChunkDetail = ref(false);
+const selectedChunk = ref<DocumentChunk | null>(null);
+const chunkDetailLoading = ref(false);
+const chunkDetailError = ref("");
 const libraryPendingDeletion = ref<Library | null>(null);
 const chatPendingDeletion = ref<ChatSession | null>(null);
 const newLibrary = ref({ name: "", subject: "", description: "" });
-const newChat = ref({ title: "", libraryId: "" });
+const newChat = ref({ libraryId: "" });
 const prompt = ref("");
 const fileInput = ref<HTMLInputElement | null>(null);
+const chatBody = ref<HTMLElement | null>(null);
+const streamingAssistantId = ref("");
 const chunkingConfig = ref<ChunkingConfig>({
   chunk_model: "interface",
   chunk_size: 800,
@@ -81,6 +88,10 @@ const activeLibrary = computed(() => libraries.value.find((library) => library.i
 const activeChat = computed(() => chats.value.find((chat) => chat.id === activeChatId.value));
 const totalPages = computed(() => Math.max(1, Math.ceil(totalChunks.value / 12)));
 const pageLabel = computed(() => `${currentPage.value} / ${totalPages.value}`);
+const processingDocuments = computed(() => documents.value.filter((document) => document.status === "processing"));
+let progressPollTimer: ReturnType<typeof window.setInterval> | undefined;
+let progressPollInFlight = false;
+let chunkDetailRequest = 0;
 
 function replaceChat(updated: ChatSession) {
   chats.value = chats.value.map((chat) => (chat.id === updated.id ? updated : chat));
@@ -137,6 +148,88 @@ async function loadActiveLibrary() {
   }
 }
 
+async function openChunk(chunk: DocumentChunkSummary) {
+  if (!activeLibraryId.value) return;
+
+  const requestId = ++chunkDetailRequest;
+  selectedChunk.value = null;
+  chunkDetailError.value = "";
+  chunkDetailLoading.value = true;
+  showChunkDetail.value = true;
+
+  try {
+    const detail = await api.getChunk(activeLibraryId.value, chunk.id);
+    if (requestId === chunkDetailRequest) {
+      selectedChunk.value = detail;
+    }
+  } catch (reason) {
+    if (requestId === chunkDetailRequest) {
+      chunkDetailError.value = reason instanceof Error ? reason.message : "加载分块详情失败。";
+    }
+  } finally {
+    if (requestId === chunkDetailRequest) {
+      chunkDetailLoading.value = false;
+    }
+  }
+}
+
+function closeChunkDetail() {
+  chunkDetailRequest += 1;
+  showChunkDetail.value = false;
+  selectedChunk.value = null;
+  chunkDetailError.value = "";
+  chunkDetailLoading.value = false;
+}
+
+function processingStageLabel(stage: string) {
+  return {
+    queued: "等待处理",
+    extracting: "正在提取文本",
+    parsing: "正在解析题目",
+    chunking: "正在分块",
+    indexing: "正在写入向量库",
+  }[stage] || "正在处理";
+}
+
+function stopProgressPolling() {
+  if (progressPollTimer) {
+    window.clearInterval(progressPollTimer);
+    progressPollTimer = undefined;
+  }
+}
+
+async function pollDocumentProgress() {
+  if (progressPollInFlight || !activeLibraryId.value) return;
+
+  progressPollInFlight = true;
+  try {
+    const libraryId = activeLibraryId.value;
+    const documentList = await api.listDocuments(libraryId);
+    if (libraryId !== activeLibraryId.value) return;
+
+    documents.value = documentList;
+    if (!documentList.some((document) => document.status === "processing")) {
+      stopProgressPolling();
+      await Promise.all([loadLibraries(), loadActiveLibrary()]);
+    }
+  } catch {
+    // The normal data refresh path will show actionable request errors.
+  } finally {
+    progressPollInFlight = false;
+  }
+}
+
+function updateProgressPolling() {
+  if (!activeLibraryId.value || !processingDocuments.value.length) {
+    stopProgressPolling();
+    return;
+  }
+  if (!progressPollTimer) {
+    progressPollTimer = window.setInterval(() => void pollDocumentProgress(), 1000);
+    void pollDocumentProgress();
+  }
+}
+
 async function loadActiveChat() {
   if (!activeChatId.value) {
     chatMessages.value = [];
@@ -186,7 +279,7 @@ async function createLibrary() {
 
 function openNewChat() {
   newChatError.value = "";
-  newChat.value = { title: "", libraryId: activeLibraryId.value };
+  newChat.value = { libraryId: activeLibraryId.value };
   showNewChat.value = true;
 }
 
@@ -195,12 +288,11 @@ async function createChat() {
   newChatError.value = "";
   try {
     const chat = await api.createChat({
-      title: newChat.value.title.trim() || "新建聊天",
       library_id: newChat.value.libraryId || undefined,
     });
     chats.value.unshift(chat);
     activeChatId.value = chat.id;
-    newChat.value = { title: "", libraryId: "" };
+    newChat.value = { libraryId: "" };
     showNewChat.value = false;
   } catch (reason) {
     newChatError.value = reason instanceof Error ? reason.message : "创建聊天失败。";
@@ -332,15 +424,58 @@ async function sendMessage() {
 
   chatBusy.value = true;
   error.value = "";
+  prompt.value = "";
+  const temporaryUserId = `temporary-user-${Date.now()}`;
+  const temporaryAssistantId = `temporary-assistant-${Date.now()}`;
+  chatMessages.value.push(
+    {
+      id: temporaryUserId,
+      role: "user",
+      content: query,
+      citations: [],
+      created_at: null,
+    },
+    {
+      id: temporaryAssistantId,
+      role: "assistant",
+      content: "",
+      citations: [],
+      created_at: null,
+    },
+  );
+  streamingAssistantId.value = temporaryAssistantId;
+  await scrollChatToBottom();
   try {
-    const exchange = await api.sendChatMessage(chat.id, query);
-    chatMessages.value.push(exchange.user_message, exchange.assistant_message);
-    prompt.value = "";
+    await api.streamChatMessage(chat.id, query, {
+      onDelta: (content) => {
+        const assistantMessage = chatMessages.value.find((message) => message.id === temporaryAssistantId);
+        if (!assistantMessage) return;
+        assistantMessage.content += content;
+        void scrollChatToBottom();
+      },
+      onDone: (exchange) => {
+        chatMessages.value = chatMessages.value.map((message) => {
+          if (message.id === temporaryUserId) return exchange.user_message;
+          if (message.id === temporaryAssistantId) return exchange.assistant_message;
+          return message;
+        });
+        void scrollChatToBottom();
+      },
+    });
     await loadChats();
   } catch (reason) {
+    chatMessages.value = chatMessages.value.filter((message) => message.id !== temporaryAssistantId);
     error.value = reason instanceof Error ? reason.message : "发送消息失败。";
   } finally {
+    streamingAssistantId.value = "";
     chatBusy.value = false;
+  }
+}
+
+async function scrollChatToBottom() {
+  await nextTick();
+  if (chatBody.value) {
+    chatBody.value.scrollTop = chatBody.value.scrollHeight;
   }
 }
 
@@ -359,6 +494,7 @@ function nextPage() {
 
 watch([activeLibraryId, currentPage], loadActiveLibrary);
 watch(activeChatId, loadActiveChat);
+watch([activeLibraryId, processingDocuments], updateProgressPolling, { immediate: true });
 
 onMounted(async () => {
   window.addEventListener("popstate", syncViewFromLocation);
@@ -373,6 +509,7 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   window.removeEventListener("popstate", syncViewFromLocation);
+  stopProgressPolling();
 });
 </script>
 
@@ -500,6 +637,26 @@ onBeforeUnmount(() => {
           <div><span>已就绪</span><strong>{{ documents.filter((item) => item.status === "ready").length }}</strong></div>
         </div>
 
+        <section v-if="processingDocuments.length" class="processing-documents" aria-live="polite">
+          <div v-for="document in processingDocuments" :key="document.id" class="processing-document">
+            <div class="processing-document-header">
+              <FileText :size="16" />
+              <strong>{{ document.filename }}</strong>
+              <span>{{ processingStageLabel(document.processing_stage) }}</span>
+              <small>{{ document.progress }}%</small>
+            </div>
+            <div
+              class="progress-track"
+              role="progressbar"
+              :aria-valuenow="document.progress"
+              aria-valuemin="0"
+              aria-valuemax="100"
+            >
+              <span :style="{ width: `${document.progress}%` }"></span>
+            </div>
+          </div>
+        </section>
+
         <div class="question-toolbar">
           <label class="search-field">
             <Search :size="17" />
@@ -510,20 +667,21 @@ onBeforeUnmount(() => {
         </div>
 
         <div class="question-list">
-          <article v-for="chunk in chunks" :key="chunk.id" class="question-item">
-            <div class="question-number">{{ chunk.sequence }}</div>
-            <div class="question-body">
-              <p v-if="chunk.chapter" class="chunk-title">{{ chunk.chapter }}</p>
-              <p class="question-stem chunk-content">{{ chunk.content }}</p>
-              <div class="source-row">
-                <FileText :size="14" />
-                <span>{{ chunk.document_name || "已导入文档" }}</span>
-                <span v-if="chunk.source_page_start">
-                  第 {{ chunk.source_page_start }} 页<template v-if="chunk.source_page_end && chunk.source_page_end !== chunk.source_page_start">-{{ chunk.source_page_end }} 页</template>
+          <article v-for="chunk in chunks" :key="chunk.id" class="chunk-summary">
+            <button class="chunk-summary-button" type="button" @click="openChunk(chunk)">
+              <span class="question-number">{{ chunk.sequence }}</span>
+              <span class="chunk-summary-body">
+                <span class="chunk-title">{{ chunk.chapter || chunk.document_name || "已导入文档" }}</span>
+                <span class="chunk-preview">{{ chunk.content_preview }}</span>
+                <span class="source-row">
+                  <FileText :size="14" />
+                  <span>{{ chunk.document_name || "已导入文档" }}</span>
+                  <span v-if="chunk.source_page_start">
+                    第 {{ chunk.source_page_start }} 页<template v-if="chunk.source_page_end && chunk.source_page_end !== chunk.source_page_start">-{{ chunk.source_page_end }} 页</template>
+                  </span>
                 </span>
-                <span>字符 {{ chunk.char_start }}-{{ chunk.char_end }}</span>
-              </div>
-            </div>
+              </span>
+            </button>
           </article>
           <div v-if="listLoading" class="state-line"><LoaderCircle class="spin" :size="18" />正在加载分块</div>
           <div v-else-if="!chunks.length" class="state-line">暂无分块</div>
@@ -561,7 +719,7 @@ onBeforeUnmount(() => {
         <button class="icon-button chat-create-button" type="button" title="创建聊天" @click="openNewChat"><Plus :size="17" /></button>
       </header>
 
-      <div class="chat-body">
+      <div ref="chatBody" class="chat-body">
         <div v-if="chatLoading" class="chat-empty"><LoaderCircle class="spin" :size="20" /></div>
         <div v-else-if="!activeChat" class="chat-empty"><MessageSquareText :size="22" /><p>请先创建聊天。</p></div>
         <div v-else-if="!chatMessages.length" class="chat-empty"><MessageSquareText :size="22" /><p>当前聊天暂无消息。</p></div>
@@ -569,7 +727,10 @@ onBeforeUnmount(() => {
           <template v-for="message in chatMessages" :key="message.id">
             <div v-if="message.role === 'user'" class="question-bubble">{{ message.content }}</div>
             <div v-else class="assistant-message">
-              <div class="answer-bubble">{{ message.content }}</div>
+              <div class="answer-bubble">
+                <LoaderCircle v-if="message.id === streamingAssistantId && !message.content" class="spin" :size="17" />
+                <template v-else>{{ message.content }}</template>
+              </div>
               <section v-if="message.citations.length" class="citations">
                 <p>引用来源</p>
                 <div v-for="citation in message.citations" :key="citation.id" class="citation">
@@ -633,7 +794,6 @@ onBeforeUnmount(() => {
           <h2>创建聊天</h2>
           <button class="icon-button" type="button" title="关闭" @click="showNewChat = false"><X :size="18" /></button>
         </div>
-        <label>聊天名称<input v-model="newChat.title" autofocus placeholder="例如：订单接口评审" /></label>
         <label>
           挂载知识库
           <select v-model="newChat.libraryId">
@@ -689,6 +849,36 @@ onBeforeUnmount(() => {
           </button>
         </div>
       </form>
+    </div>
+
+    <div v-if="showChunkDetail" class="modal-backdrop" @click.self="closeChunkDetail">
+      <section class="modal chunk-detail-modal" role="dialog" aria-modal="true" aria-labelledby="chunk-detail-title">
+        <div class="modal-title">
+          <h2 id="chunk-detail-title">分块详情</h2>
+          <button class="icon-button" type="button" title="关闭" @click="closeChunkDetail"><X :size="18" /></button>
+        </div>
+        <div v-if="chunkDetailLoading" class="chunk-detail-state">
+          <LoaderCircle class="spin" :size="18" />
+          正在加载完整内容
+        </div>
+        <p v-else-if="chunkDetailError" class="modal-error">{{ chunkDetailError }}</p>
+        <template v-else-if="selectedChunk">
+          <dl class="chunk-detail-meta">
+            <div><dt>分块</dt><dd>{{ selectedChunk.sequence }}</dd></div>
+            <div><dt>文档</dt><dd>{{ selectedChunk.document_name || "已导入文档" }}</dd></div>
+            <div v-if="selectedChunk.chapter"><dt>章节</dt><dd>{{ selectedChunk.chapter }}</dd></div>
+            <div v-if="selectedChunk.source_page_start">
+              <dt>页码</dt>
+              <dd>
+                {{ selectedChunk.source_page_start }}
+                <template v-if="selectedChunk.source_page_end && selectedChunk.source_page_end !== selectedChunk.source_page_start">-{{ selectedChunk.source_page_end }}</template>
+              </dd>
+            </div>
+            <div><dt>字符范围</dt><dd>{{ selectedChunk.char_start }}-{{ selectedChunk.char_end }}</dd></div>
+          </dl>
+          <pre class="chunk-detail-content">{{ selectedChunk.content }}</pre>
+        </template>
+      </section>
     </div>
 
     <ChunkingSettings

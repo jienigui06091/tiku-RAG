@@ -128,7 +128,11 @@ def chunk_document(
         ):
             if section is not None:
                 chapter = section
-            for content, local_start, local_end in _split_windows(section_text, chunk_size, chunk_overlap):
+            if chunk_model == "delimiter":
+                windows = [(section_text, 0, len(section_text))]
+            else:
+                windows = _split_windows(section_text, chunk_size, chunk_overlap)
+            for content, local_start, local_end in windows:
                 chunks.append(
                     ChunkDraft(
                         sequence=len(chunks) + 1,
