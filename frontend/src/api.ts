@@ -162,6 +162,13 @@ export interface SystemSettings {
   ocr_api_key_configured: boolean;
 }
 
+export interface LlmSettings {
+  llm_base_url: string | null;
+  llm_model: string | null;
+  llm_temperature: number;
+  llm_api_key_configured: boolean;
+}
+
 export type SystemSettingsUpdate = Partial<Omit<SystemSettings,
   "minio_access_key_configured" | "minio_secret_key_configured" | "milvus_token_configured" |
   "embedding_api_key_configured" | "rerank_api_key_configured" | "llm_api_key_configured" |
@@ -174,6 +181,10 @@ export type SystemSettingsUpdate = Partial<Omit<SystemSettings,
   rerank_api_key?: string;
   llm_api_key?: string;
   ocr_api_key?: string;
+};
+
+export type LlmSettingsUpdate = Partial<Pick<LlmSettings, "llm_base_url" | "llm_model" | "llm_temperature">> & {
+  llm_api_key?: string;
 };
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -270,6 +281,9 @@ export const api = {
   getSystemSettings: () => request<SystemSettings>("/admin/settings"),
   updateSystemSettings: (payload: SystemSettingsUpdate) =>
     request<SystemSettings>("/admin/settings", { method: "PUT", body: JSON.stringify(payload) }),
+  getLlmSettings: () => request<LlmSettings>("/settings/llm"),
+  updateLlmSettings: (payload: LlmSettingsUpdate) =>
+    request<LlmSettings>("/settings/llm", { method: "PUT", body: JSON.stringify(payload) }),
   listLibraries: () => request<Library[]>("/libraries"),
   createLibrary: (payload: { name: string; subject?: string; description?: string }) =>
     request<Library>("/libraries", { method: "POST", body: JSON.stringify(payload) }),

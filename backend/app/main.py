@@ -35,6 +35,8 @@ from app.schemas import (
     ReindexRequest,
     ReindexResult,
     LoginRequest,
+    LlmSettingsOut,
+    LlmSettingsUpdate,
     SystemSettingsOut,
     SystemSettingsUpdate,
     UserCreate,
@@ -45,7 +47,14 @@ from app.services.auth import create_session, get_current_user, hash_password, r
 from app.services.documents import chunk_document, extract_text_from_bytes, parse_questions
 from app.services.retrieval import delete_chunks, generate_answer, index_chunks, retrieve_chunks, stream_answer
 from app.services.storage import ObjectStorageError, delete_upload, store_upload
-from app.services.runtime_config import RuntimeConfigError, get_runtime_settings, get_system_settings_out, save_system_settings
+from app.services.runtime_config import (
+    RuntimeConfigError,
+    get_llm_settings_out,
+    get_runtime_settings,
+    get_system_settings_out,
+    save_llm_settings,
+    save_system_settings,
+)
 
 settings = get_settings()
 app = FastAPI(title=settings.app_name, version="0.2.0")
@@ -178,6 +187,28 @@ def update_system_settings(
     except (RuntimeConfigError, ValueError) as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
     _audit(db, actor, "settings.update", "system_settings", None, {"fields": sorted(payload.model_fields_set)})
+    return result
+
+
+@app.get("/api/settings/llm", response_model=LlmSettingsOut)
+def get_llm_settings(db: Session = Depends(get_db), _: User = Depends(get_current_user)):
+    try:
+        return get_llm_settings_out(db)
+    except RuntimeConfigError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+@app.put("/api/settings/llm", response_model=LlmSettingsOut)
+def update_llm_settings(
+    payload: LlmSettingsUpdate,
+    db: Session = Depends(get_db),
+    actor: User = Depends(get_current_user),
+):
+    try:
+        result = save_llm_settings(db, payload, actor)
+    except (RuntimeConfigError, ValueError) as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    _audit(db, actor, "settings.llm.update", "system_settings", None, {"fields": sorted(payload.model_fields_set)})
     return result
 
 
@@ -492,8 +523,6 @@ async def send_chat_message(
     user: User = Depends(get_current_user),
 ):
     chat = _get_chat_session(db, chat_id, user)
-    if not chat.library_id:
-        raise HTTPException(status_code=422, detail="Attach a knowledge base before sending a message")
 
     is_first_message = not db.scalar(
         select(func.count(ChatMessage.id)).where(ChatMessage.chat_session_id == chat.id)
@@ -512,7 +541,11 @@ async def send_chat_message(
 
     async def event_stream():
         try:
-            matches = await retrieve_chunks(db, payload.query, chat.library_id, None, payload.top_k)
+            matches = (
+                await retrieve_chunks(db, payload.query, chat.library_id, None, payload.top_k)
+                if chat.library_id
+                else []
+            )
             citations = [
                 Citation(
                     id=chunk.id,

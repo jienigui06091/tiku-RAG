@@ -112,12 +112,12 @@ function replaceChat(updated: ChatSession) {
   chats.value = chats.value.map((chat) => (chat.id === updated.id ? updated : chat));
 }
 
-function isAdminView(candidate: PageView) {
-  return candidate === "users" || candidate === "settings";
+function requiresSuperAdmin(candidate: PageView) {
+  return candidate === "users";
 }
 
 function ensureAccessibleView(user: CurrentUser | null) {
-  if (!user || user.role === "super_admin" || !isAdminView(view.value)) return;
+  if (!user || user.role === "super_admin" || !requiresSuperAdmin(view.value)) return;
   view.value = "libraries";
   if (window.location.pathname !== "/") {
     window.history.replaceState({}, "", "/");
@@ -125,7 +125,7 @@ function ensureAccessibleView(user: CurrentUser | null) {
 }
 
 async function navigate(nextView: PageView) {
-  if (isAdminView(nextView) && currentUser.value?.role !== "super_admin") {
+  if (requiresSuperAdmin(nextView) && currentUser.value?.role !== "super_admin") {
     nextView = "libraries";
   }
   const pathname = nextView === "chats" ? "/chats" : nextView === "users" ? "/users" : nextView === "settings" ? "/settings" : "/";
@@ -491,7 +491,7 @@ async function reindexLibrary() {
 async function sendMessage() {
   const chat = activeChat.value;
   const query = prompt.value.trim();
-  if (!chat || !chat.library_id || !query) return;
+  if (!chat || !query) return;
 
   const controller = new AbortController();
   let didTimeout = false;
@@ -624,10 +624,14 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
+  <main v-if="authLoading" class="app-loading" aria-live="polite">
+    <LoaderCircle class="spin" :size="20" />
+    <span>正在恢复会话</span>
+  </main>
   <LoginView
-    v-if="authLoading || !currentUser"
+    v-else-if="!currentUser"
     :ready="bootstrapReady"
-    :loading="authLoading || loginBusy"
+    :loading="loginBusy"
     :error="loginError"
     @login="login"
   />
@@ -641,6 +645,7 @@ onBeforeUnmount(() => {
         </div>
       </div>
 
+      <div class="sidebar-main">
       <nav class="page-navigation" aria-label="主导航">
         <button class="page-navigation-item" :class="{ active: view === 'libraries' }" type="button" @click="navigate('libraries')">
           <LibraryBig :size="17" />
@@ -654,7 +659,7 @@ onBeforeUnmount(() => {
           <Users :size="17" />
           <span>成员</span>
         </button>
-        <button v-if="currentUser.role === 'super_admin'" class="page-navigation-item" :class="{ active: view === 'settings' }" type="button" @click="navigate('settings')">
+        <button class="page-navigation-item" :class="{ active: view === 'settings' }" type="button" @click="navigate('settings')">
           <Settings2 :size="17" />
           <span>配置</span>
         </button>
@@ -723,6 +728,7 @@ onBeforeUnmount(() => {
         </nav>
       </section>
 
+      </div>
       <div class="sidebar-foot sidebar-account">
         <span>{{ currentUser.display_name }}</span>
         <button class="icon-button" type="button" title="退出登录" @click="logout"><LogOut :size="16" /></button>
@@ -730,69 +736,74 @@ onBeforeUnmount(() => {
     </aside>
 
     <section v-if="view === 'libraries'" class="content">
-      <header class="content-header">
-        <div>
-          <p class="eyebrow">{{ activeLibrary?.subject || "知识库工作台" }}</p>
-          <h1>{{ activeLibrary?.name || "请选择或创建知识库" }}</h1>
-          <p class="subhead">
-            {{ activeLibrary?.description || "导入文档后，可按接口、标题、固定窗口或自定义分隔符创建可检索分块。" }}
-          </p>
-        </div>
-        <div v-if="activeLibrary" class="header-actions">
-          <input ref="fileInput" class="visually-hidden" type="file" accept=".pdf,.docx,.txt,.md" @change="uploadFile" />
-          <button class="icon-button bordered" type="button" title="分块设置" @click="showChunkSettings = true">
-            <Settings2 :size="17" />
-          </button>
-          <button class="primary-button" type="button" :disabled="uploadBusy" @click="chooseFile">
-            <LoaderCircle v-if="uploadBusy" class="spin" :size="17" />
-            <Upload v-else :size="17" />
-            {{ uploadBusy ? "正在导入" : "导入文档" }}
-          </button>
-        </div>
-      </header>
+      <div class="library-sticky-panel">
+        <header class="content-header">
+          <div>
+            <p class="eyebrow">{{ activeLibrary?.subject || "知识库工作台" }}</p>
+            <h1>{{ activeLibrary?.name || "请选择或创建知识库" }}</h1>
+            <p class="subhead">
+              {{ activeLibrary?.description || "导入文档后，可按接口、标题、固定窗口或自定义分隔符创建可检索分块。" }}
+            </p>
+          </div>
+          <div v-if="activeLibrary" class="header-actions">
+            <input ref="fileInput" class="visually-hidden" type="file" accept=".pdf,.docx,.txt,.md" @change="uploadFile" />
+            <button class="icon-button bordered" type="button" title="分块设置" @click="showChunkSettings = true">
+              <Settings2 :size="17" />
+            </button>
+            <button class="primary-button" type="button" :disabled="uploadBusy" @click="chooseFile">
+              <LoaderCircle v-if="uploadBusy" class="spin" :size="17" />
+              <Upload v-else :size="17" />
+              {{ uploadBusy ? "正在导入" : "导入文档" }}
+            </button>
+          </div>
+        </header>
 
-      <div v-if="error" class="error-banner">
-        <span>{{ error }}</span>
-        <button class="icon-button" type="button" title="关闭提示" @click="error = ''"><X :size="16" /></button>
+        <div v-if="error" class="error-banner">
+          <span>{{ error }}</span>
+          <button class="icon-button" type="button" title="关闭提示" @click="error = ''"><X :size="16" /></button>
+        </div>
+
+        <template v-if="!loading && activeLibrary">
+          <div class="stats-row">
+            <div><span>分块数</span><strong>{{ activeLibrary.chunk_count }}</strong></div>
+            <div><span>文档数</span><strong>{{ documents.length }}</strong></div>
+            <div><span>已就绪</span><strong>{{ documents.filter((item) => item.status === "ready").length }}</strong></div>
+          </div>
+
+          <section v-if="processingDocuments.length" class="processing-documents" aria-live="polite">
+            <div v-for="document in processingDocuments" :key="document.id" class="processing-document">
+              <div class="processing-document-header">
+                <FileText :size="16" />
+                <strong>{{ document.filename }}</strong>
+                <span>{{ processingStageLabel(document.processing_stage) }}</span>
+                <small>{{ document.progress }}%</small>
+              </div>
+              <div
+                class="progress-track"
+                role="progressbar"
+                :aria-valuenow="document.progress"
+                aria-valuemin="0"
+                aria-valuemax="100"
+              >
+                <span :style="{ width: `${document.progress}%` }"></span>
+              </div>
+            </div>
+          </section>
+
+          <div class="question-toolbar">
+            <label class="search-field">
+              <Search :size="17" />
+              <input v-model="keyword" placeholder="搜索接口、文档或分块内容" @keyup.enter="submitSearch" />
+            </label>
+            <button class="icon-button bordered" type="button" title="搜索分块" @click="submitSearch"><Search :size="17" /></button>
+            <span class="result-count">{{ totalChunks }} 个分块</span>
+          </div>
+        </template>
       </div>
 
       <div v-if="loading" class="state-line initial-loading"><LoaderCircle class="spin" :size="18" />正在加载工作台</div>
 
       <template v-else-if="activeLibrary">
-        <div class="stats-row">
-          <div><span>分块数</span><strong>{{ activeLibrary.chunk_count }}</strong></div>
-          <div><span>文档数</span><strong>{{ documents.length }}</strong></div>
-          <div><span>已就绪</span><strong>{{ documents.filter((item) => item.status === "ready").length }}</strong></div>
-        </div>
-
-        <section v-if="processingDocuments.length" class="processing-documents" aria-live="polite">
-          <div v-for="document in processingDocuments" :key="document.id" class="processing-document">
-            <div class="processing-document-header">
-              <FileText :size="16" />
-              <strong>{{ document.filename }}</strong>
-              <span>{{ processingStageLabel(document.processing_stage) }}</span>
-              <small>{{ document.progress }}%</small>
-            </div>
-            <div
-              class="progress-track"
-              role="progressbar"
-              :aria-valuenow="document.progress"
-              aria-valuemin="0"
-              aria-valuemax="100"
-            >
-              <span :style="{ width: `${document.progress}%` }"></span>
-            </div>
-          </div>
-        </section>
-
-        <div class="question-toolbar">
-          <label class="search-field">
-            <Search :size="17" />
-            <input v-model="keyword" placeholder="搜索接口、文档或分块内容" @keyup.enter="submitSearch" />
-          </label>
-          <button class="icon-button bordered" type="button" title="搜索分块" @click="submitSearch"><Search :size="17" /></button>
-          <span class="result-count">{{ totalChunks }} 个分块</span>
-        </div>
 
         <div class="question-list">
           <article v-for="chunk in chunks" :key="chunk.id" class="chunk-summary">
@@ -880,8 +891,8 @@ onBeforeUnmount(() => {
       <form class="chat-form" @submit.prevent="sendMessage">
         <textarea
           v-model="prompt"
-          :disabled="!activeChat || !activeChat.library_id || chatBusy"
-          :placeholder="activeChat?.library_id ? '请输入关于当前知识库的问题' : '请先挂载知识库再发送消息'"
+          :disabled="!activeChat || chatBusy"
+          :placeholder="activeChat?.library_id ? '请输入关于当前知识库的问题' : '请输入消息'"
         ></textarea>
         <button v-if="chatBusy" class="send-button" type="button" title="Stop generation" @click="cancelChatStream">
           <X :size="18" />
@@ -891,7 +902,7 @@ onBeforeUnmount(() => {
           class="send-button"
           type="submit"
           title="发送消息"
-          :disabled="!activeChat || !activeChat.library_id || !prompt.trim() || chatBusy"
+          :disabled="!activeChat || !prompt.trim() || chatBusy"
         >
           <LoaderCircle v-if="chatBusy" class="spin" :size="18" />
           <SendHorizontal v-else :size="18" />

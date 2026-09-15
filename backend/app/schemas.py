@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class LibraryCreate(BaseModel):
@@ -264,3 +264,19 @@ class SystemSettingsUpdate(BaseModel):
     ocr_base_url: str | None = None
     ocr_api_key: str | None = Field(default=None, max_length=1024)
     max_upload_mb: int | None = Field(default=None, ge=1, le=2048)
+
+
+class LlmSettingsOut(BaseModel):
+    llm_base_url: str | None
+    llm_model: str | None
+    llm_temperature: float = Field(ge=0, le=2)
+    llm_api_key_configured: bool
+
+
+class LlmSettingsUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    llm_base_url: str | None = None
+    llm_api_key: str | None = Field(default=None, max_length=1024)
+    llm_model: str | None = Field(default=None, max_length=200)
+    llm_temperature: float | None = Field(default=None, ge=0, le=2)

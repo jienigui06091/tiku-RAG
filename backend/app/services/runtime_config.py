@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.config import Settings, get_settings
 from app.models import SystemSetting, User
-from app.schemas import SystemSettingsOut, SystemSettingsUpdate
+from app.schemas import LlmSettingsOut, LlmSettingsUpdate, SystemSettingsOut, SystemSettingsUpdate
 
 SECRET_KEYS = {
     "minio_access_key",
@@ -43,6 +43,17 @@ def get_system_settings_out(db: Session) -> SystemSettingsOut:
     return SystemSettingsOut.model_validate(values)
 
 
+def get_llm_settings_out(db: Session) -> LlmSettingsOut:
+    settings = get_runtime_settings(db)
+    stored_keys = {row.key for row in db.query(SystemSetting.key).all()}
+    return LlmSettingsOut(
+        llm_base_url=settings.llm_base_url,
+        llm_model=settings.llm_model,
+        llm_temperature=settings.llm_temperature,
+        llm_api_key_configured="llm_api_key" in stored_keys or bool(settings.llm_api_key),
+    )
+
+
 def save_system_settings(db: Session, payload: SystemSettingsUpdate, actor: User) -> SystemSettingsOut:
     updates = payload.model_dump(exclude_unset=True)
     if (
@@ -72,6 +83,12 @@ def save_system_settings(db: Session, payload: SystemSettingsUpdate, actor: User
         row.updated_by_id = actor.id
     db.commit()
     return get_system_settings_out(db)
+
+
+def save_llm_settings(db: Session, payload: LlmSettingsUpdate, actor: User) -> LlmSettingsOut:
+    updates = SystemSettingsUpdate(**payload.model_dump(exclude_unset=True))
+    save_system_settings(db, updates, actor)
+    return get_llm_settings_out(db)
 
 
 def _read_value(row: SystemSetting) -> Any:
